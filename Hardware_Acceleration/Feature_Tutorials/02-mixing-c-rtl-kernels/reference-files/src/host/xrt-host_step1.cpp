@@ -1,13 +1,7 @@
-#/*
-#Copyright (C) 2023, Advanced Micro Devices, Inc. All rights reserved.
-#SPDX-License-Identifier: X11
-#*/
-
-//#include "cmdlineparser.h"
 #include <iostream>
+#include <fstream>
 #include <cstring>
-
-// XRT includes
+#include <stdexcept>
 #include "xrt/xrt_bo.h"
 #include <experimental/xrt_xclbin.h>
 #include "xrt/xrt_device.h"
@@ -16,68 +10,66 @@
 #define DATA_SIZE 4096
 
 int main(int argc, char** argv) {
-
-    std::string binaryFile;
-    std::cout << "argc = " << argc << std::endl;
-    for(int i=0; i < argc; i++){
-	std::cout << "argv[" << i << "] = " << argv[i] << std::endl;
-    }
-    if (argc > 1) {
-	binaryFile = argv[1];
-    } else {
-	binaryFile = "./krnl_vadd.sw_emu.xclbin";
+    if (argc < 4) {
+        std::cerr << "Usage: " << argv[0] << " <xclbin_file> <input_file> <output_file>\n";
+        return -1;
     }
 
-    // Read settings
-    int device_index = 0;
-    std::cout << "Open the device" << device_index << std::endl;
-    auto device = xrt::device(device_index);
-    std::cout << "Load the xclbin " << binaryFile << std::endl;
+    std::string binaryFile = argv[1];
+    std::string inputFile = argv[2];
+    std::string outputFile = argv[3];
+
+    // Open device and load xclbin
+    auto device = xrt::device(0);
     auto uuid = device.load_xclbin(binaryFile);
-
-    size_t vector_size_bytes = sizeof(int) * DATA_SIZE;
-
-    //auto krnl = xrt::kernel(device, uuid, "vadd");
     auto krnl = xrt::kernel(device, uuid, "krnl_vadd", xrt::kernel::cu_access_mode::exclusive);
 
-    std::cout << "Allocate Buffer in Global Memory\n";
-    auto boIn1 = xrt::bo(device, vector_size_bytes, krnl.group_id(0)); //Match kernel arguments to RTL kernel
+    // Allocate buffers
+    size_t vector_size_bytes = sizeof(int) * DATA_SIZE;
+    auto boIn1 = xrt::bo(device, vector_size_bytes, krnl.group_id(0));
     auto boIn2 = xrt::bo(device, vector_size_bytes, krnl.group_id(1));
     auto boOut = xrt::bo(device, vector_size_bytes, krnl.group_id(2));
-
-    // Map the contents of the buffer object into host memory
     auto bo0_map = boIn1.map<int*>();
     auto bo1_map = boIn2.map<int*>();
     auto bo2_map = boOut.map<int*>();
-    std::fill(bo0_map, bo0_map + DATA_SIZE, 0);
-    std::fill(bo1_map, bo1_map + DATA_SIZE, 0);
-    std::fill(bo2_map, bo2_map + DATA_SIZE, 0);
 
-    // Create the test data
-    int bufReference[DATA_SIZE];
-    for (int i = 0; i < DATA_SIZE; ++i) {
-        bo0_map[i] = i;
-        bo1_map[i] = i;
-        bufReference[i] = bo0_map[i] + bo1_map[i]; //Generate check data for validation
+    // Read input data
+    std::ifstream inFile(inputFile);
+    if (!inFile) {
+        std::cerr << "Error: Unable to open input file.\n";
+        return -1;
     }
+    for (int i = 0; i < DATA_SIZE; ++i) {
+        if (!(inFile >> bo0_map[i])) {
+            std::cerr << "Error: Insufficient data in input file.\n";
+            return -1;
+        }
+        bo1_map[i] = bo0_map[i]; // Modify if needed
+    }
+    inFile.close();
 
-    // Synchronize buffer content with device side
-    std::cout << "synchronize input buffer data to device global memory\n";
+    // Sync input buffers to device
     boIn1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     boIn2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-    std::cout << "Execution of the kernel\n";
-    auto run = krnl(boIn1, boIn2, boOut, DATA_SIZE); //DATA_SIZE=size
+    // Run the kernel
+    auto run = krnl(boIn1, boIn2, boOut, DATA_SIZE);
     run.wait();
 
-    // Get the output;
-    std::cout << "Get the output data from the device" << std::endl;
+    // Sync output buffer from device
     boOut.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
-    // Validate results
-    if (std::memcmp(bo2_map, bufReference, vector_size_bytes))
-        throw std::runtime_error("Value read back does not match reference");
+    // Write output data
+    std::ofstream outFile(outputFile);
+    if (!outFile) {
+        std::cerr << "Error: Unable to open output file.\n";
+        return -1;
+    }
+    for (int i = 0; i < DATA_SIZE; ++i) {
+        outFile << bo2_map[i] << "\n";
+    }
+    outFile.close();
 
-    std::cout << "TEST WITH ONE KERNEL PASSED\n";
+    std::cout << "Execution completed successfully. Output written to " << outputFile << std::endl;
     return 0;
 }
